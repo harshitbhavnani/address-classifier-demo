@@ -221,8 +221,7 @@ United States">{{ request.form.get('address', '') }}</textarea>
 
         <div class="address-text">{{ result.address }}</div>
         <div class="meta">
-          Confidence: {{ "%.2f"|format(result.confidence) }}<br>
-          Nearby places checked: {{ result.get("nearby_count", "N/A") }}
+          Confidence: {{ "%.2f"|format(result.confidence) }}
         </div>
         <div class="reason">{{ result.reason }}</div>
       </div>
@@ -237,7 +236,7 @@ United States">{{ request.form.get('address', '') }}</textarea>
 </html>
 """
 
-# ---------- CORE LOGIC (YOUR NOTEBOOK CODE, ADAPTED) ----------
+# ---------- CORE LOGIC ----------
 
 def haversine_distance_m(lat1, lon1, lat2, lon2):
     """Distance in meters between two lat/lng points."""
@@ -265,8 +264,8 @@ def extract_address_features(address: str) -> dict:
         "has_suite_office": has_suite,
         "has_apartment_unit": has_apartment,
     }
-    
-def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 50) -> dict:
+
+def get_place_context(address: str, api_key: str, radius_m: int = 50) -> dict:
     """
     Focused approach: single search with distance-tiered nearby analysis.
     Also attempts text search to find building names.
@@ -274,7 +273,7 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
     # Single Find Place search
     find_url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
     find_params = {
-        "key": GOOGLE_PLACES_API_KEY,
+        "key": api_key,
         "input": address,
         "inputtype": "textquery",
         "fields": "name,formatted_address,types,business_status,user_ratings_total,geometry,place_id,rating",
@@ -283,7 +282,7 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
     # Also try Text Search API for better building name detection
     textsearch_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     textsearch_params = {
-        "key": GOOGLE_PLACES_API_KEY,
+        "key": api_key,
         "query": address,
     }
     
@@ -313,7 +312,7 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
                 "lat": lat,
                 "lng": lng,
             }
-    except Exception as e:
+    except Exception:
         pass
     
     # Try text search to find building names
@@ -328,7 +327,7 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
             types = result.get("types", [])
             # Look for residential building names
             if any(keyword in name.lower() for keyword in 
-                   ["apartment", "residence", "tower", "condo", "loft", "manor", "villa", "court", "place"]):
+                   ["apartment", "residence", "tower", "condo", "loft", "manor", "villa", "court", "place", "gateway"]):
                 alternative_names.append({
                     "name": name,
                     "types": types,
@@ -346,36 +345,6 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
             "address_features": extract_address_features(address),
         }
     
-    c = candidates[0]
-    loc = c.get("geometry", {}).get("location", {})
-    lat, lng = loc.get("lat"), loc.get("lng")
-    
-    main_place = {
-        "name": c.get("name"),
-        "formatted_address": c.get("formatted_address"),
-        "types": c.get("types", []),
-        "business_status": c.get("business_status"),
-        "user_ratings_total": c.get("user_ratings_total", 0),
-        "rating": c.get("rating"),
-        "lat": lat,
-        "lng": lng,
-    }
-    
-    c = candidates[0]
-    loc = c.get("geometry", {}).get("location", {})
-    lat, lng = loc.get("lat"), loc.get("lng")
-    
-    main_place = {
-        "name": c.get("name"),
-        "formatted_address": c.get("formatted_address"),
-        "types": c.get("types", []),
-        "business_status": c.get("business_status"),
-        "user_ratings_total": c.get("user_ratings_total", 0),
-        "rating": c.get("rating"),
-        "lat": lat,
-        "lng": lng,
-    }
-    
     nearby_places = []
     distance_tiers = {
         "exact_match": [],      # 0-5m (same location)
@@ -387,7 +356,7 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
         # Nearby search
         nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
         nearby_params = {
-            "key": GOOGLE_PLACES_API_KEY,
+            "key": api_key,
             "location": f"{lat},{lng}",
             "radius": radius_m,
         }
@@ -432,7 +401,6 @@ def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 
         "distance_tiers": distance_tiers,
         "address_features": extract_address_features(address),
     }
-
 
 REFINED_SYSTEM_PROMPT = """
 You are an address classification assistant that determines whether an address is primarily residential or business.
@@ -502,8 +470,7 @@ OUTPUT FORMAT:
 }
 """
 
-
-def classify_address_improved(address: str, GOOGLE_PLACES_API_KEY: str, client) -> dict:
+def classify_address_improved(address: str) -> dict:
     """
     Refined classifier focusing on quality over quantity of signals.
     """
@@ -512,6 +479,7 @@ def classify_address_improved(address: str, GOOGLE_PLACES_API_KEY: str, client) 
     except Exception as e:
         context = {
             "main_place": None,
+            "alternative_names": [],
             "nearby_places": [],
             "distance_tiers": {},
             "address_features": extract_address_features(address),
@@ -579,10 +547,9 @@ def index():
     if request.method == "POST":
         address = request.form.get("address", "").strip()
         if address:
-            result = classify_address_smart(address)
+            result = classify_address_improved(address)
             result["address"] = address
     return render_template_string(HTML, result=result)
-
 
 @app.route("/api/classify", methods=["POST"])
 def api_classify():
@@ -595,7 +562,6 @@ def api_classify():
     result = classify_address_improved(address)
     result["address"] = address
     return jsonify(result)
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
