@@ -4,6 +4,8 @@ import json
 import requests
 from flask import Flask, request, jsonify, render_template_string
 from openai import OpenAI
+import re
+from typing import Dict, List, Optional
 
 # ---------- CONFIG ----------
 
@@ -239,189 +241,301 @@ United States">{{ request.form.get('address', '') }}</textarea>
 
 def haversine_distance_m(lat1, lon1, lat2, lon2):
     """Distance in meters between two lat/lng points."""
-    R = 6371000  # Earth radius in m
+    R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = phi2 - phi1
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-
-def get_place_context(address: str, radius_m: int = 40) -> dict:
+def extract_address_features(address: str) -> dict:
+    """Extract structural features from address text."""
+    addr_lower = address.lower()
+    
+    # Business indicators
+    suite_pattern = r'\b(ste|suite|office|floor|fl|bldg|building)\b\.?\s*\d+|#[a-z]'
+    has_suite = bool(re.search(suite_pattern, addr_lower))
+    
+    # Residential indicators  
+    apt_pattern = r'\b(apt|apartment|unit)\b\.?\s*\d+|#\d+'
+    has_apartment = bool(re.search(apt_pattern, addr_lower))
+    
+    return {
+        "has_suite_office": has_suite,
+        "has_apartment_unit": has_apartment,
+    }
+    
+def get_place_context(address: str, GOOGLE_PLACES_API_KEY: str, radius_m: int = 50) -> dict:
     """
-    1) Find main place (the address) via Find Place From Text, with geometry.
-    2) Use Nearby Search around that location to get nearby POIs.
-    Returns a dict with main_place + a small list of nearby_places.
+    Focused approach: single search with distance-tiered nearby analysis.
+    Also attempts text search to find building names.
     """
-    if not GOOGLE_PLACES_API_KEY:
-        raise RuntimeError("GOOGLE_PLACES_API_KEY environment variable is not set")
-
-    # Step 1: Find Place
+    # Single Find Place search
     find_url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
     find_params = {
         "key": GOOGLE_PLACES_API_KEY,
         "input": address,
         "inputtype": "textquery",
-        "fields": "name,formatted_address,types,business_status,user_ratings_total,geometry",
+        "fields": "name,formatted_address,types,business_status,user_ratings_total,geometry,place_id,rating",
     }
-    r = requests.get(find_url, params=find_params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
-    candidates = data.get("candidates", [])
-    if not candidates:
+    
+    # Also try Text Search API for better building name detection
+    textsearch_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    textsearch_params = {
+        "key": GOOGLE_PLACES_API_KEY,
+        "query": address,
+    }
+    
+    # Try both APIs
+    main_place = None
+    lat, lng = None, None
+    alternative_names = []
+    
+    try:
+        r = requests.get(find_url, params=find_params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        candidates = data.get("candidates", [])
+        
+        if candidates:
+            c = candidates[0]
+            loc = c.get("geometry", {}).get("location", {})
+            lat, lng = loc.get("lat"), loc.get("lng")
+            
+            main_place = {
+                "name": c.get("name"),
+                "formatted_address": c.get("formatted_address"),
+                "types": c.get("types", []),
+                "business_status": c.get("business_status"),
+                "user_ratings_total": c.get("user_ratings_total", 0),
+                "rating": c.get("rating"),
+                "lat": lat,
+                "lng": lng,
+            }
+    except Exception as e:
+        pass
+    
+    # Try text search to find building names
+    try:
+        r2 = requests.get(textsearch_url, params=textsearch_params, timeout=10)
+        r2.raise_for_status()
+        text_data = r2.json()
+        text_results = text_data.get("results", [])
+        
+        for result in text_results[:5]:
+            name = result.get("name", "")
+            types = result.get("types", [])
+            # Look for residential building names
+            if any(keyword in name.lower() for keyword in 
+                   ["apartment", "residence", "tower", "condo", "loft", "manor", "villa", "court", "place"]):
+                alternative_names.append({
+                    "name": name,
+                    "types": types,
+                    "source": "text_search"
+                })
+    except Exception:
+        pass
+    
+    if not main_place:
         return {
             "main_place": None,
+            "alternative_names": alternative_names,
             "nearby_places": [],
+            "distance_tiers": {},
+            "address_features": extract_address_features(address),
         }
-
+    
     c = candidates[0]
     loc = c.get("geometry", {}).get("location", {})
     lat, lng = loc.get("lat"), loc.get("lng")
-
+    
     main_place = {
         "name": c.get("name"),
         "formatted_address": c.get("formatted_address"),
         "types": c.get("types", []),
         "business_status": c.get("business_status"),
         "user_ratings_total": c.get("user_ratings_total", 0),
+        "rating": c.get("rating"),
         "lat": lat,
         "lng": lng,
     }
-
-    # If no lat/lng, we can't do Nearby
-    if lat is None or lng is None:
-        return {
-            "main_place": main_place,
-            "nearby_places": [],
-        }
-
-    # Step 2: Nearby Search
-    nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    nearby_params = {
-        "key": GOOGLE_PLACES_API_KEY,
-        "location": f"{lat},{lng}",
-        "radius": radius_m,
+    
+    c = candidates[0]
+    loc = c.get("geometry", {}).get("location", {})
+    lat, lng = loc.get("lat"), loc.get("lng")
+    
+    main_place = {
+        "name": c.get("name"),
+        "formatted_address": c.get("formatted_address"),
+        "types": c.get("types", []),
+        "business_status": c.get("business_status"),
+        "user_ratings_total": c.get("user_ratings_total", 0),
+        "rating": c.get("rating"),
+        "lat": lat,
+        "lng": lng,
     }
-    r2 = requests.get(nearby_url, params=nearby_params, timeout=10)
-    r2.raise_for_status()
-    nearby_data = r2.json()
-    results = nearby_data.get("results", [])
-
+    
     nearby_places = []
-    for res in results[:10]:  # limit to top 10
-        rloc = res.get("geometry", {}).get("location", {})
-        rlat, rlng = rloc.get("lat"), rloc.get("lng")
-        dist = None
-        if rlat is not None and rlng is not None:
-            dist = haversine_distance_m(lat, lng, rlat, rlng)
-
-        nearby_places.append({
-            "name": res.get("name"),
-            "types": res.get("types", []),
-            "business_status": res.get("business_status"),
-            "user_ratings_total": res.get("user_ratings_total", 0),
-            "distance_m": dist,
-        })
-
+    distance_tiers = {
+        "exact_match": [],      # 0-5m (same location)
+        "same_building": [],    # 5-30m
+        "adjacent": [],         # 30-70m
+    }
+    
+    if lat and lng:
+        # Nearby search
+        nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        nearby_params = {
+            "key": GOOGLE_PLACES_API_KEY,
+            "location": f"{lat},{lng}",
+            "radius": radius_m,
+        }
+        
+        try:
+            r2 = requests.get(nearby_url, params=nearby_params, timeout=10)
+            r2.raise_for_status()
+            nearby_data = r2.json()
+            results = nearby_data.get("results", [])
+            
+            for res in results[:25]:
+                rloc = res.get("geometry", {}).get("location", {})
+                rlat, rlng = rloc.get("lat"), rloc.get("lng")
+                dist = None
+                if rlat is not None and rlng is not None:
+                    dist = haversine_distance_m(lat, lng, rlat, rlng)
+                
+                place_info = {
+                    "name": res.get("name"),
+                    "types": res.get("types", []),
+                    "business_status": res.get("business_status"),
+                    "user_ratings_total": res.get("user_ratings_total", 0),
+                    "distance_m": dist,
+                }
+                nearby_places.append(place_info)
+                
+                # Categorize by distance
+                if dist is not None:
+                    if dist <= 5:
+                        distance_tiers["exact_match"].append(place_info)
+                    elif dist <= 30:
+                        distance_tiers["same_building"].append(place_info)
+                    else:
+                        distance_tiers["adjacent"].append(place_info)
+        except Exception:
+            pass
+    
     return {
         "main_place": main_place,
+        "alternative_names": alternative_names,
         "nearby_places": nearby_places,
+        "distance_tiers": distance_tiers,
+        "address_features": extract_address_features(address),
     }
 
 
-SYSTEM_PROMPT = """
-You are an address classification assistant.
+REFINED_SYSTEM_PROMPT = """
+You are an address classification assistant that determines whether an address is primarily residential or business.
 
-You will receive a JSON object with:
-- "address": the raw address string.
-- "main_place": information about the address from Google Places (may be null), with keys:
-    - name, formatted_address, types, business_status, user_ratings_total, lat, lng
-- "nearby_places": a list of nearby Google Places results within a small radius, each with:
-    - name, types, business_status, user_ratings_total, distance_m
+You will receive data about an address including:
+- The address text itself
+- Information about what's located at that address
+- Names of buildings or businesses found there (check both main_place and alternative_names)
+- What's nearby (within roughly 30 meters)
 
-Your job is to classify the address property itself into one of:
-- "residential"  = primarily a home or apartment building
-- "business"     = primarily used by businesses (offices, shops, restaurants, banks, coworking, etc.)
-- "unknown"      = you cannot reliably infer if it is residential or business.
+Your job is to classify the address as:
+- "residential" = homes, apartments, condos, or residential buildings
+- "business" = offices, stores, restaurants, banks, or commercial buildings  
+- "unknown" = insufficient information to determine confidently
 
-Guidelines:
+CRITICAL CLASSIFICATION RULES (apply in this order):
 
-1) Use the ADDRESS TEXT:
-- Suite/floor/room tokens like "Ste 2050", "Suite 300", "Floor 5" usually indicate business offices.
-- PO Boxes, mail centers, UPS/FedEx Stores, virtual offices are business.
-- Apartment-style tokens such as "Apt", "Apartment", "Unit", "#", or words like "Apartments", "Residences",
-  "Condos", "Student Housing" suggest residential.
+1. ADDRESS TEXT - Strongest signal:
+   - "Suite", "Ste", "Office", "Floor" + number = BUSINESS (office space)
+   - "Apt", "Apartment", "Unit" + number = RESIDENTIAL
+   - These override most other signals
 
-2) Use MAIN_PLACE:
-- If types include clearly business categories (e.g., "bank", "store", "restaurant", "gym", "real_estate_agency",
-  "lawyer", "accounting", "insurance_agency", "cafe", "coworking_space", "shopping_mall", "hospital",
-  "school", "university", "local_government_office", "lodging") OR there is a non-null business_status
-  or user_ratings_total > 0, this is strong evidence of business use.
-- Types like "premise" or "subpremise" alone are neutral and do NOT prove residential or business.
+2. BUILDING NAMES - Check both main_place name and alternative_names array:
+   RESIDENTIAL building names (high priority):
+   - Contains: "Apartments", "Residences", "Condos", "Towers", "Lofts", "Village", "Manor", "Court", "Gateway" + residential context
+   - Examples: "Shoreline Gateway", "Centurion Apartments", "Ocean Towers", "Pine Avenue Lofts"
+   - IF YOU FIND THESE → The building is RESIDENTIAL, even if there are businesses nearby
+   
+   Important: Many residential buildings have ground-floor retail (restaurants, real estate offices, shops). The presence of these businesses does NOT make the building commercial - it's still a residential building with retail tenants.
+   
+   BUSINESS building names:
+   - Specific business: "Farmers Bank", "Joe's Pizza", "Smith Law Offices"
+   - Commercial centers: "Office Plaza", "Business Center", "Professional Building"
 
-3) Use NEARBY_PLACES:
-- If there are many distinct businesses (restaurants, bars, shops, offices, banks, etc.) within ~30–40 meters,
-  especially sharing the same or very similar address, it strongly suggests a commercial or mixed-use building.
-- If there are zero or almost no POIs within that small radius, it is more likely a purely residential property.
-- A single corner cafe nearby is not enough by itself to call the property a business; focus on patterns and density.
+3. WHAT'S AT THE ADDRESS:
+   - Multiple businesses with no residential building name → Likely BUSINESS
+   - Specific business operating at this address → BUSINESS
+   - Real estate agency alone is NOT conclusive (could manage residential or commercial)
+   - Empty/no businesses + no other indicators → Lean RESIDENTIAL
 
-4) Decision:
-- If evidence strongly favors business, choose "business".
-- If evidence strongly favors residential, choose "residential".
-- If the evidence is mixed or weak and you cannot be reasonably confident, choose "unknown".
+4. DECISION PRIORITY:
+   Residential building name (Apartments/Residences/etc.) ALWAYS indicates RESIDENTIAL, regardless of nearby businesses.
+   
+   Only classify as BUSINESS if:
+   - Suite/Office in address, OR
+   - Specific business name identified with no residential building name, OR
+   - Multiple businesses present with no residential building name
 
-Output:
-Return a single JSON object:
+EXPLANATION STYLE:
+Write for business executives in plain language. Do NOT use technical terms like "exact_match tier", "main_place types", "distance_tiers", "address_features", or API field names.
 
+Good examples:
+✓ "This is Shoreline Gateway, a residential apartment building. While there are some businesses on the ground floor, the building itself is residential."
+✓ "The address includes Suite 2050, indicating office space, and multiple law firms are located here."
+✓ "This appears to be a commercial building with several operating businesses including restaurants and offices."
+
+Bad examples:
+✗ "The exact_match tier contains operational businesses..."
+✗ "Based on address_features.has_suite_office being true..."
+✗ "The alternative_names array shows..."
+
+OUTPUT FORMAT:
 {
   "category": "residential" | "business" | "unknown",
-  "confidence": float between 0 and 1,
-  "reason": "very short explanation (1–2 sentences)"
+  "confidence": 0.0-1.0,
+  "reason": "Clear explanation (1-2 sentences) in plain business language"
 }
 """
 
 
-def classify_address_smart(address: str) -> dict:
+def classify_address_improved(address: str, GOOGLE_PLACES_API_KEY: str, client) -> dict:
     """
-    Classify address using:
-    - main_place (Find Place)
-    - nearby_places (Nearby Search)
-    - LLM reasoning over the full context.
-    Always returns {category, confidence, reason, nearby_count}.
+    Refined classifier focusing on quality over quantity of signals.
     """
     try:
-        place_context = get_place_context(address)
+        context = get_place_context(address, GOOGLE_PLACES_API_KEY)
     except Exception as e:
-        place_context = {
+        context = {
             "main_place": None,
             "nearby_places": [],
+            "distance_tiers": {},
+            "address_features": extract_address_features(address),
             "error": str(e),
         }
-
-    context = {
-        "address": address,
-        "main_place": place_context.get("main_place"),
-        "nearby_places": place_context.get("nearby_places", []),
-        "error": place_context.get("error"),
-    }
-
+    
+    # Add original address to context
+    context["address"] = address
+    
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": REFINED_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                "Classify this address using the full context below.\n\n"
-                f"INPUT JSON:\n{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
-                "Return ONLY the JSON object."
+                "Classify this address using the prioritized rules.\n\n"
+                f"INPUT:\n{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
+                "Return JSON with category, confidence, and reason."
             ),
         },
     ]
-
+    
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o",
             messages=messages,
             temperature=0,
             response_format={"type": "json_object"},
@@ -429,32 +543,32 @@ def classify_address_smart(address: str) -> dict:
         content = response.choices[0].message.content
         data = json.loads(content)
     except Exception as e:
-        data = {
+        return {
             "category": "unknown",
             "confidence": 0.0,
-            "reason": f"Error calling LLM API or parsing JSON: {e}",
+            "reason": f"LLM API error: {e}",
         }
-
+    
     category = str(data.get("category", "unknown")).lower()
     if category not in {"residential", "business", "unknown"}:
         category = "unknown"
-
+    
     try:
         confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
-
+    
     reason = str(data.get("reason", ""))
-
-    # Optional threshold
-    if confidence < 0.6 and category != "unknown":
+    
+    # Stricter threshold
+    if confidence < 0.65 and category != "unknown":
         category = "unknown"
-
+        reason += " [Low confidence]"
+    
     return {
         "category": category,
         "confidence": confidence,
         "reason": reason,
-        "nearby_count": len(context.get("nearby_places", [])),
     }
 
 # ---------- FLASK ROUTES ----------
@@ -478,7 +592,7 @@ def api_classify():
     if not address:
         return jsonify({"error": "Missing 'address'"}), 400
 
-    result = classify_address_smart(address)
+    result = classify_address_improved(address)
     result["address"] = address
     return jsonify(result)
 
