@@ -60,8 +60,8 @@ HTML = """
       margin-bottom: 18px;
     }
     .logo {
-      width: 40px;
-      height: 40px;
+      width: 60px;
+      height: 60px;
       border-radius: 999px;
       background: radial-gradient(circle at 30% 30%, #38bdf8, #0f172a);
       display: flex;
