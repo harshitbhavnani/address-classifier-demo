@@ -191,7 +191,7 @@ HTML = """
   <div class="wrapper">
     <div class="card">
       <div class="header">
-        <div class="logo">AI</div>
+        <div class="logo">FMB</div>
         <div>
           <h1>Address Classifier</h1>
           <div class="subtitle">Classify an address as residential, business, or unknown using Google Places + LLM.</div>
