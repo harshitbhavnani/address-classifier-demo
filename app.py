@@ -161,6 +161,7 @@ HTML = """
     .pill.residential { background: rgba(34, 197, 94, 0.18); border-color: rgba(34, 197, 94, 0.8); color: #bbf7d0; }
     .pill.business    { background: rgba(56, 189, 248, 0.18); border-color: rgba(56, 189, 248, 0.8); color: #bae6fd; }
     .pill.unknown     { background: rgba(148, 163, 184, 0.18); border-color: rgba(148, 163, 184, 0.8); color: #e5e7eb; }
+    .pill.coworking   { background: rgba(168, 85, 247, 0.18); border-color: rgba(168, 85, 247, 0.8); color: #e9d5ff; margin-left: 6px; }
     .address-text {
       font-size: 13px;
       color: #e5e7eb;
@@ -218,6 +219,12 @@ United States">{{ request.form.get('address', '') }}</textarea>
           <span>&#9679;</span>
           <span>{{ result.category|upper }}</span>
         </div>
+        {% if result.is_coworking_space %}
+        <div class="pill coworking">
+          <span>&#128188;</span>
+          <span>LIKELY CO-WORKING SPACE</span>
+        </div>
+        {% endif %}
 
         <div class="address-text">{{ result.address }}</div>
         <div class="meta">
@@ -416,6 +423,8 @@ Your job is to classify the address as:
 - "business" = offices, stores, restaurants, banks, or commercial buildings  
 - "unknown" = insufficient information to determine confidently
 
+You also need to detect if the address is likely a co-working space or shared office building
+
 CRITICAL CLASSIFICATION RULES (apply in this order):
 
 1. ADDRESS TEXT - Strongest signal:
@@ -440,6 +449,22 @@ CRITICAL CLASSIFICATION RULES (apply in this order):
    - Specific business operating at this address → BUSINESS
    - Real estate agency alone is NOT conclusive (could manage residential or commercial)
    - Empty/no businesses + no other indicators → Lean RESIDENTIAL
+
+CO-WORKING SPACE DETECTION:
+Co-working spaces (WeWork, Regus, shared offices) have a distinctive pattern:
+- Multiple DIVERSE businesses at the EXACT SAME ADDRESS (within 0-5m)
+- The businesses are from different industries (e.g., consulting, law, tech, finance, marketing)
+- Typically 5+ distinct businesses listed
+- Building name may include: "Workspace", "Center", "Offices", "Commons", "Hub", "Studios"
+- Common co-working indicators: WeWork, Regus, Spaces, The Office, Executive Suites
+
+If you detect 5+ diverse businesses at the same location (exact_match tier), set is_coworking_space to true.
+Examples of diverse industries: consulting + law firm + tech startup + marketing agency + financial services
+
+NOT co-working indicators:
+- Shopping mall/plaza with retail stores (not diverse professional services)
+- Office building where all businesses are related (e.g., all law firms in a legal building)
+- Ground-floor retail in residential building (coffee shop + gym + convenience store)
 
 4. DECISION PRIORITY:
    Residential building name (Apartments/Residences/etc.) ALWAYS indicates RESIDENTIAL, regardless of nearby businesses.
@@ -466,7 +491,8 @@ OUTPUT FORMAT:
 {
   "category": "residential" | "business" | "unknown",
   "confidence": 0.0-1.0,
-  "reason": "Clear explanation (1-2 sentences) in plain business language"
+  "reason": "Clear explanation (1-2 sentences) in plain business language",
+  "is_coworking_space": true | false
 }
 """
 
@@ -527,6 +553,7 @@ def classify_address_improved(address: str) -> dict:
         confidence = 0.0
     
     reason = str(data.get("reason", ""))
+    is_coworking = data.get("is_coworking_space", False)
     
     # Stricter threshold
     if confidence < 0.65 and category != "unknown":
@@ -537,6 +564,7 @@ def classify_address_improved(address: str) -> dict:
         "category": category,
         "confidence": confidence,
         "reason": reason,
+        "is_coworking_space": is_coworking,
     }
 
 # ---------- FLASK ROUTES ----------
